@@ -119,11 +119,14 @@ let r = e
 (* A poll is just a 0-byte allocation to trigger all the behaviour an allocation entails
  * Especially important for multicore, numerical applications. *)
 let add_poll e =
-  let none = Debuginfo.none in
-  Csequence (Cop (Calloc, [Cblockheader (Nativeint.zero, none)], none), e)
+  let dbg, _args = Debuginfo.none, [Cconst_int 1] in
+  (* Stolen from cmmgen.ml for 0-sized float-arrays *)
+  let block_header tag sz = Nativeint.(add (shift_left (of_int sz) 10) (of_int tag)) in
+  Csequence (Cop(Calloc, Cblockheader(block_header 0 0, dbg) :: [], dbg), e)
 
 let insert_poll = 
 
+  (* Is/should this reset on every call? *)
   let delta = ref (l_max - e) in
 
   (* Right to left evaluation? Unless the list is already reversed? *)
@@ -133,6 +136,7 @@ let insert_poll =
       | (exp :: exps) -> let exp = non_branch exp in loop (exp :: acc) exps in
     loop [] (List.rev exps)
 
+  (* Non-branching instructions *)
   and non_branch exp =
     let exp = insert_poll exp in
     if !delta >= l_max - 1 then
@@ -144,11 +148,20 @@ let insert_poll =
 
     function
 
-    (* Non-branching instructions *)
     | Cconst_int _     | Cconst_natint _     | Cconst_float _ | Cconst_symbol _
-    | Cconst_pointer _ | Cconst_natpointer _ | Cblockheader _ | Cvar _  as exp -> non_branch exp
+    | Cconst_pointer _ | Cconst_natpointer _ | Cblockheader _ | Cvar _  as exp ->
+        if !delta >= l_max - 1 then
+          (delta := 1; add_poll exp)
+        else
+          (delta := !delta + 1; exp)
 
-    | Clet (id, exp1, exp2) -> let exp1 = non_branch exp1 in Clet(id, exp1, insert_poll exp2)
+    | Clet (id, exp1, exp2) ->
+        (* Don't poll when an address is being computed, otherwise bad GC root (emit.mlp) *)
+        begin match exp1 with
+        | Cop(Cadda, _, _) -> (delta := !delta + 1; Clet (id, exp1, insert_poll exp2))
+        | _ -> let exp1 = non_branch exp1 in Clet(id, exp1, insert_poll exp2)
+        end
+
     | Cassign (id, exp) -> Cassign (id, insert_poll exp)
     | Ctuple exps -> Ctuple (insert_polls exps)
     | Csequence (exp1, exp2) -> let exp1 = non_branch exp1 in Csequence (exp1, insert_poll exp2)
@@ -218,13 +231,14 @@ let insert_poll =
         else
           Cexit (int,exps)
 
-    (* Function calls *)
     | Cop (operation, exps, debug) -> cop_poll operation exps debug
 
   and cop_poll op exps debug = 
-    let exps = insert_polls exps in
+
+    (* Function calls *)
     match op with
     | Capply _ ->
+        let exps = insert_polls exps in
         if !delta >= l_max - e then
           (delta := e + r;
            add_poll (Cop (op, exps, debug)))
@@ -232,15 +246,27 @@ let insert_poll =
           (delta := e + (max !delta r);
            Cop(op, exps, debug))
 
-    | Cextcall _ | Cload _ | Calloc | Cstore _ | Caddi | Csubi | Cmuli | Cmulhi | Cdivi | Cmodi
+    (* Don't poll when an address is being computed, otherwise bad GC root (emit.mlp) *)
+    | Cload _ | Cstore _ ->
+        begin match exps with
+        | [Cop(Cadda, _, _)] ->
+            (delta := !delta + 1; Cop (op, exps, debug))
+        | _ ->
+            let exps = insert_polls exps in
+            (delta := !delta + 1; Cop (op, exps, debug))
+        end
+
+    (* A poll can't do anything about a Cextcall messing up *)
+    | Cextcall _ | Calloc | Caddi | Csubi | Cmuli | Cmulhi | Cdivi | Cmodi
     | Cand | Cor | Cxor | Clsl | Clsr | Casr | Ccmpi _
     | Caddv (* pointer addition that produces a [Val] (well-formed Caml value) *)
     | Cadda (* pointer addition that produces a [Addr] (derived heap pointer) *)
     | Ccmpa _ | Cnegf | Cabsf | Caddf | Csubf | Cmulf | Cdivf | Cfloatofint | Cintoffloat
     | Ccmpf _ | Craise _ | Ccheckbound ->
-        Cop (op, exps, debug)
+        let exps = insert_polls exps in
+        (delta := !delta + 1; Cop (op, exps, debug))
 
-  in insert_poll
+  in fun x -> (delta := l_max - e; insert_poll x)
 
 (* End: Polling efficiently on stock hardware - Marc Feeley *)
 
